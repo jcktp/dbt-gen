@@ -179,6 +179,55 @@ def yesno(label, default_yes=True):
         return default_yes
     return raw in ("y", "yes")
 
+
+def pick_folder(label="Select the destination folder", current=None):
+    """Open a native OS folder picker, or fall back to manual path entry."""
+    if current:
+        dim(f"Current: {current}")
+        print()
+
+    # Try native folder picker first
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()            # hide the root window
+        root.attributes("-topmost", True)
+        root.update()
+
+        dim("Opening folder picker...")
+        chosen = filedialog.askdirectory(
+            title=label,
+            initialdir=current or str(Path.home()),
+            mustexist=True,
+        )
+        root.destroy()
+
+        if chosen:
+            return str(Path(chosen).resolve())
+        # User cancelled the dialog — fall through to manual entry
+        warn("Folder picker was cancelled.")
+        print()
+    except Exception:
+        # tkinter not available (headless server, WSL without display, etc.)
+        dim("(No graphical folder picker available — type the path instead)")
+        print()
+
+    # Fallback: manual path entry with tab-completion hint
+    while True:
+        raw = ask(f"{label}\n  Paste or type the full path")
+        p = Path(raw).expanduser().resolve()
+        if p.is_dir():
+            return str(p)
+        if p.parent.is_dir():
+            if yesno(f"  '{p}' doesn't exist yet. Create it?"):
+                p.mkdir(parents=True, exist_ok=True)
+                ok(f"Created {p}")
+                return str(p)
+        err(f"'{raw}' is not a valid directory. Try again.")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Config management
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,10 +274,38 @@ def setup_api():
     print()
     _, model = pick(f"Which model? (recommended: {prov['default_model']})", prov["models"])
 
-    config = {"provider": provider_key, "api_key": api_key, "model": model}
+    # Ask for output folder during first-time setup
+    print()
+    heading("Output folder")
+    dim("Where should generated dbt models be saved?")
+    dim("Pick your dbt project's root, e.g. ~/my_dbt_project/")
+    dim("(model files will be written into models/ inside it)")
+    print()
+    output_folder = pick_folder("Select your dbt project folder")
+
+    config = {"provider": provider_key, "api_key": api_key, "model": model,
+              "output_folder": output_folder}
     save_config(config)
     print()
     ok(f"Saved! Using {prov['name']} ({model})")
+    ok(f"Output folder: {output_folder}")
+    return config
+
+
+def setup_output_folder(config):
+    """Change the output folder interactively."""
+    heading("Set output folder")
+    dim("Where should generated dbt models be saved?")
+    dim("Pick your dbt project's root or any folder you like.")
+    print()
+    folder = pick_folder(
+        label="Select the destination folder",
+        current=config.get("output_folder"),
+    )
+    config["output_folder"] = folder
+    save_config(config)
+    print()
+    ok(f"Output folder set to: {C.BOLD}{folder}{C.RESET}")
     return config
 
 def get_config():
@@ -237,6 +314,16 @@ def get_config():
     if config.get("provider") and config.get("api_key"):
         if "model" not in config:
             config["model"] = PROVIDERS[config["provider"]]["default_model"]
+        # Prompt for output folder if not yet configured
+        if not config.get("output_folder"):
+            print()
+            heading("One more thing — set your output folder")
+            dim("Where should generated dbt models be saved?")
+            dim("Pick your dbt project's root or any folder you like.")
+            print()
+            config["output_folder"] = pick_folder("Select the destination folder")
+            save_config(config)
+            ok(f"Output folder: {config['output_folder']}")
         return config
     return setup_api()
 
@@ -310,12 +397,15 @@ def _groq(prompt, key, model):
 # File writing
 # ──────────────────────────────────────────────────────────────────────────────
 
-def write_output(result, folder_name):
+def write_output(result, folder_name, output_folder=None):
     if not result or not result.get("files"):
         warn("Nothing was generated. Try describing it differently.")
         return
 
-    base = Path.cwd() / folder_name
+    if output_folder:
+        base = Path(output_folder) / folder_name
+    else:
+        base = Path.cwd() / folder_name
     heading("Created files")
 
     for f in result["files"]:
@@ -340,7 +430,6 @@ def write_output(result, folder_name):
 
     print()
     ok(f"All files saved to: {C.BOLD}{base.resolve()}{C.RESET}")
-    dim("Copy the models/ folder into your dbt project when ready.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Source system picker
@@ -437,7 +526,7 @@ Generate ALL files with proper dbt naming, structure, YAML schemas, and tests.
 Use sensible column names based on common data patterns. Note any assumptions.
 """
     result = call_llm(prompt, config)
-    write_output(result, folder)
+    write_output(result, folder, config.get("output_folder"))
     return folder
 
 
@@ -477,7 +566,7 @@ Generate:
 3. Schema YAML with tests and descriptions
 """
     result = call_llm(prompt, config)
-    write_output(result, folder)
+    write_output(result, folder, config.get("output_folder"))
     return folder
 
 
@@ -510,7 +599,7 @@ Generate:
 2. Schema YAML with tests and column descriptions
 """
     result = call_llm(prompt, config)
-    write_output(result, folder)
+    write_output(result, folder, config.get("output_folder"))
     return folder
 
 
@@ -543,7 +632,7 @@ Generate:
 2. Schema YAML with comprehensive column descriptions and tests
 """
     result = call_llm(prompt, config)
-    write_output(result, folder)
+    write_output(result, folder, config.get("output_folder"))
     return folder
 
 
@@ -561,6 +650,7 @@ MENU = [
     "Add a staging model  (clean up a raw source table)",
     "Add a transformation (join or reshape existing models)",
     "Add a final table    (the output for dashboards/reports)",
+    "Set output folder    (change where files are saved)",
     "Change settings      (switch AI provider or API key)",
 ]
 
@@ -580,8 +670,10 @@ def main():
         try:
             # Show status
             prov = PROVIDERS.get(config["provider"], {})
+            out = config.get("output_folder", "(current directory)")
             print()
             dim(f"Using {prov.get('name', '?')} ({config.get('model', '?')})")
+            dim(f"Output → {out}")
             print()
 
             # Main menu
@@ -607,11 +699,15 @@ def main():
                 continue
 
             if choice == 5:
+                config = setup_output_folder(config)
+                continue
+
+            if choice == 6:
                 config = setup_api()
                 continue
 
-            if choice < 1 or choice > 5:
-                err("Pick 1 to 5.")
+            if choice < 1 or choice > 6:
+                err("Pick 1 to 6.")
                 continue
 
             # Run the generator

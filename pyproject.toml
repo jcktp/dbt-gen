@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "dbt-gen"
+version = "1.0.0"
+description = "AI-powered dbt model generator. Describe what you need, get production-ready dbt models."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+# No hard dependency on either SDK — install whichever you use
+dependencies = []
+
+[project.optional-dependencies]
+openai = ["openai>=1.0.0"]
+groq = ["openai>=1.0.0"]  # Groq uses the OpenAI SDK with a different base URL
+anthropic = ["anthropic>=0.39.0"]
+all = ["openai>=1.0.0", "anthropic>=0.39.0"]
+
+[project.scripts]
+dbt-gen = "dbt_gen:main"
+
+[tool.setuptools]
+py-modules = ["dbt_gen"]

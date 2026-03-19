@@ -1,6 +1,6 @@
 # dbt-gen
 
-AI-powered dbt model generator. Describe what you need in plain English, get production-ready dbt models out.
+dbt model generator — AI-powered or fully local with templates. Describe what you need, get production-ready dbt models out.
 
 Built for data teams where analysts know their data but don't want to hand-write every SQL file, YAML schema, and test from scratch.
 
@@ -13,12 +13,18 @@ Built for data teams where analysts know their data but don't want to hand-write
 
 You run `python3 dbt_gen.py`, tell it what data you're working with and what you want to see at the end, and it generates a complete set of dbt files — source definitions, staging models, intermediate transformations, and final mart tables — all following [dbt Labs best practices](https://docs.getdbt.com/best-practices/how-we-structure/1-guide-overview).
 
-Every run creates a named folder inside your configured output directory (e.g. your dbt project root). Review the files, adjust column names to match your warehouse, and you're good to go.
+You can run it in two modes:
+
+- **AI mode** — describe what you want in plain English, and a language model writes the SQL, YAML, and tests for you. Great when you want fully fleshed-out logic from a description.
+- **Local mode** — no API key, no internet, no cost. You provide your column names and the tool generates properly structured dbt scaffolding from built-in templates. You fill in the join logic and final SELECTs yourself. Great for getting the boilerplate right instantly.
+
+Every run creates a named folder inside your configured output directory. Review the files, adjust as needed, and you're good to go.
 
 ## Supported providers
 
 | Provider | Install | Notes |
 |---|---|---|
+| **Local templates** | *(none)* | No AI, no API key, works offline. You provide columns, it builds scaffolding. |
 | **OpenAI** | `pip install openai` | gpt-4o, gpt-4.1, etc. |
 | **Groq** | `pip install openai` | Free tier available, very fast. Uses the OpenAI SDK under the hood. |
 | **Anthropic** | `pip install anthropic` | Claude Sonnet, Claude Haiku |
@@ -32,7 +38,7 @@ Every run creates a named folder inside your configured output directory (e.g. y
 git clone https://github.com/jcktp/dbt-gen.git
 cd dbt-gen
 
-# 2. Install the SDK for your provider (pick one)
+# 2. (Optional) Install an AI provider SDK — skip this for local mode
 pip install openai        # for OpenAI or Groq
 pip install anthropic     # for Claude
 
@@ -40,7 +46,7 @@ pip install anthropic     # for Claude
 python3 dbt_gen.py
 ```
 
-First time, it walks you through setup — pick a provider, paste your API key, choose a model, and select your output folder. That's saved to `~/.dbt-gen.json` (permissions locked to your user only) so you don't have to do it again.
+First time, it walks you through setup — pick a provider (or local templates), paste your API key if using AI, choose a model, and select your output folder. That's saved to `~/.dbt-gen.json` (permissions locked to your user only) so you don't have to do it again.
 
 ---
 
@@ -53,7 +59,7 @@ $ python3 dbt_gen.py
   │         dbt-gen  ·  model generator     │
   └─────────────────────────────────────────┘
 
-  Using Groq (llama-3.3-70b-versatile)
+  Using local templates (no AI)
   Output → ~/analytics
 
   What do you want to do?
@@ -79,20 +85,10 @@ The one most people will use. It asks a few simple questions:
   What system is the data in?
     1) Greenhouse
     2) Ashby
-    3) Workday
-    4) BambooHR
-    5) SAP SuccessFactors
-    6) Lever
-    7) Gem
-    8) GoodTime
-    9) BrightHire
-    10) Salesforce
-    11) HubSpot
-    12) Snowflake (custom tables)
-    13) Other (type your own)
-  #: 2
+    ...
+  #: 1
 
-  Which tables from Ashby?
+  Which tables from Greenhouse?
   : applications, offers, interviews, jobs
 
   Add another system? [y/N]: y
@@ -111,7 +107,18 @@ The one most people will use. It asks a few simple questions:
   >
 ```
 
-It then generates everything — source YAML, staging models, intermediate joins, and the final mart — properly named, tested, and documented:
+In **local mode**, the tool then asks for the column names in each table (since there's no AI to guess them):
+
+```
+  Columns in Greenhouse.applications?
+  : id, candidate_id, job_id, status, applied_at, created_at
+
+  Columns in Greenhouse.offers?
+  : id, application_id, status, salary, created_at
+  ...
+```
+
+It then generates everything — source YAML, staging models, intermediate joins, and the final mart — properly named and structured:
 
 ```
   ✓ models/staging/greenhouse/_sources.yml
@@ -119,14 +126,19 @@ It then generates everything — source YAML, staging models, intermediate joins
   ✓ models/staging/greenhouse/stg_greenhouse__offers.sql
   ✓ models/staging/greenhouse/stg_greenhouse__interviews.sql
   ✓ models/staging/greenhouse/stg_greenhouse__jobs.sql
+  ✓ models/staging/greenhouse/_greenhouse__models.yml
   ✓ models/staging/workday/_sources.yml
   ✓ models/staging/workday/stg_workday__employees.sql
-  ✓ models/intermediate/recruiting/int_applications_joined_with_offers.sql
-  ✓ models/marts/recruiting/fct_recruiter_performance_monthly.sql
-  ✓ models/marts/recruiting/_recruiting__models.yml
+  ✓ models/staging/workday/_workday__models.yml
+  ✓ models/intermediate/recruiter_performance/int_recruiter_performance_joined.sql
+  ✓ models/intermediate/recruiter_performance/_recruiter_performance__models.yml
+  ✓ models/marts/recruiter_performance/fct_recruiter_performance.sql
+  ✓ models/marts/recruiter_performance/_recruiter_performance__models.yml
 
   All files saved to: ~/analytics/recruiter_performance
 ```
+
+In AI mode, the staging SQL includes AI-generated column logic; in local mode, it includes properly cast columns with `TODO` markers in the intermediate and mart models where you add your own logic.
 
 ### Option 2–4: Add individual pieces
 
@@ -145,6 +157,23 @@ Change where generated files are saved. On first run, you're asked to pick a fol
 When you pick this option, the tool opens a **native OS folder picker dialog** (on macOS/Windows/Linux with a desktop). If you're on a headless server or a terminal without GUI support, it falls back to a manual path prompt where you can paste or type the path directly. If the folder doesn't exist yet, it'll offer to create it for you.
 
 The output path is persisted in `~/.dbt-gen.json`, so it carries across sessions.
+
+---
+
+## AI mode vs local mode
+
+| | AI mode | Local mode |
+|---|---|---|
+| **Needs API key** | Yes | No |
+| **Needs internet** | Yes | No |
+| **Cost** | Per-token (free tier on Groq) | Free |
+| **Staging models** | AI writes full column logic | You provide columns, tool casts & structures them |
+| **Intermediate models** | AI writes join/transform logic | Scaffolding with `ref()` CTEs, you write the joins |
+| **Mart models** | AI writes the final SELECT | Scaffolding with config + CTEs, you write the SELECT |
+| **YAML schemas** | AI fills in descriptions & tests | Structure with `TODO` placeholders |
+| **Best for** | "Describe it and get working SQL" | "I know my columns, just give me the boilerplate" |
+
+You can switch between modes at any time via option 6 (Change settings).
 
 ---
 
@@ -197,13 +226,26 @@ The tool enforces dbt naming standards automatically:
 
 ---
 
+## Local mode details
+
+When running in local mode, the template engine:
+
+- **Infers SQL types from column names** — columns ending in `_at` or `_date` get `cast(... as timestamp)`, `_id` columns get `varchar`, `amount`/`salary`/`cost` get `numeric`, `is_`/`has_` prefixes get `boolean`, and so on.
+- **Detects primary keys** — looks for `<table>_id`, `id`, or the first `_id` column and adds `unique` + `not_null` tests automatically.
+- **Builds proper ref() chains** — intermediate models get a CTE for each input model using `{{ ref('...') }}`, mart models reference intermediates with `{{ config(materialized='table') }}`.
+- **Marks TODOs clearly** — anywhere you need to add your own logic (join conditions, final SELECTs, column descriptions), you'll see a `TODO` comment.
+
+This means you get the entire dbt folder structure, naming conventions, YAML boilerplate, and test scaffolding for free — you just fill in the business logic.
+
+---
+
 ## Configuration
 
 Config is saved to `~/.dbt-gen.json` the first time you run the tool. You can also use environment variables:
 
 ```bash
-export DBT_GEN_PROVIDER=groq          # openai, groq, or anthropic
-export DBT_GEN_API_KEY=gsk-...        # your API key
+export DBT_GEN_PROVIDER=local         # local, openai, groq, or anthropic
+export DBT_GEN_API_KEY=gsk-...        # your API key (not needed for local)
 export DBT_GEN_MODEL=llama-3.3-70b-versatile  # optional, uses provider default
 ```
 
@@ -213,14 +255,16 @@ Environment variables override the config file. To reconfigure interactively, pi
 
 ```json
 {
-  "provider": "groq",
-  "api_key": "gsk-...",
-  "model": "llama-3.3-70b-versatile",
+  "provider": "local",
+  "api_key": "",
+  "model": "templates",
   "output_folder": "/Users/you/repos/analytics"
 }
 ```
 
 ### Where to get API keys
+
+Only needed if you choose an AI provider:
 
 - **OpenAI**: [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
 - **Groq**: [console.groq.com](https://console.groq.com) (free tier available)
@@ -231,18 +275,20 @@ Environment variables override the config file. To reconfigure interactively, pi
 ## Tips
 
 - **Start with option 1** ("Create a full model") — it handles everything and you can always remove files you don't need
+- **Try local mode first** — if you know your column names, local mode gives you instant results with zero setup
 - **Point output to your dbt project** — set the output folder to your repo root so generated files land directly in the right place
-- **Describe things like you'd tell a colleague** — "I need a table that shows how many people each recruiter hired per month, with their department" works great
-- **Column names will be guesses** — the AI uses common patterns (e.g. `id`, `created_at`, `status`) but review them against your actual schema before running
+- **Describe things like you'd tell a colleague** (AI mode) — "I need a table that shows how many people each recruiter hired per month, with their department" works great
+- **Column names will be guesses in AI mode** — the AI uses common patterns (e.g. `id`, `created_at`, `status`) but review them against your actual schema before running
 - **Each run is isolated** — you can generate several models side by side and pick what works
-- **Groq is fast and free** — good default for trying things out; switch to GPT-4o or Claude for more complex models if needed
+- **Switch any time** — option 6 lets you swap between local and AI mode whenever you want
 
 ---
 
 ## Requirements
 
 - Python 3.9+
-- `openai` package (for OpenAI or Groq) and/or `anthropic` package (for Claude)
+- No additional packages needed for local mode
+- `openai` package (for OpenAI or Groq) and/or `anthropic` package (for Claude) if using AI mode
 - `tkinter` (included with most Python installs) for the native folder picker — optional, falls back to manual path entry if unavailable
 
 ---

@@ -13,7 +13,7 @@ Built for data teams where analysts know their data but don't want to hand-write
 
 You run `python3 dbt_gen.py`, tell it what data you're working with and what you want to see at the end, and it generates a complete set of dbt files — source definitions, staging models, intermediate transformations, and final mart tables — all following [dbt Labs best practices](https://docs.getdbt.com/best-practices/how-we-structure/1-guide-overview).
 
-Every run creates a named folder in your current directory. Review the files, adjust column names to match your warehouse, and copy them into your dbt project.
+Every run creates a named folder inside your configured output directory (e.g. your dbt project root). Review the files, adjust column names to match your warehouse, and you're good to go.
 
 ## Supported providers
 
@@ -40,7 +40,7 @@ pip install anthropic     # for Claude
 python3 dbt_gen.py
 ```
 
-First time, it walks you through setup — pick a provider, paste your API key, choose a model. That's saved to `~/.dbt-gen.json` (permissions locked to your user only) so you don't have to do it again.
+First time, it walks you through setup — pick a provider, paste your API key, choose a model, and select your output folder. That's saved to `~/.dbt-gen.json` (permissions locked to your user only) so you don't have to do it again.
 
 ---
 
@@ -54,6 +54,7 @@ $ python3 dbt_gen.py
   └─────────────────────────────────────────┘
 
   Using Groq (llama-3.3-70b-versatile)
+  Output → ~/analytics
 
   What do you want to do?
 
@@ -61,7 +62,8 @@ $ python3 dbt_gen.py
     2)  Add a staging model   (clean up a raw source table)
     3)  Add a transformation  (join or reshape existing models)
     4)  Add a final table     (the output for dashboards/reports)
-    5)  Change settings       (switch AI provider or API key)
+    5)  Set output folder     (change where files are saved)
+    6)  Change settings       (switch AI provider or API key)
 
   Pick a number (or q to quit):
 ```
@@ -136,14 +138,22 @@ If you already have part of a dbt project and just need to add a specific layer:
 
 Each asks the same kind of simple questions: pick your system, name it, describe what should come out.
 
+### Option 5: Set output folder
+
+Change where generated files are saved. On first run, you're asked to pick a folder during setup — typically your dbt project root. After that, the path is saved to your config and shown in the status line every time you open the menu.
+
+When you pick this option, the tool opens a **native OS folder picker dialog** (on macOS/Windows/Linux with a desktop). If you're on a headless server or a terminal without GUI support, it falls back to a manual path prompt where you can paste or type the path directly. If the folder doesn't exist yet, it'll offer to create it for you.
+
+The output path is persisted in `~/.dbt-gen.json`, so it carries across sessions.
+
 ---
 
 ## Output structure
 
-Each run creates a folder in your current directory:
+Each run creates a folder inside your configured output directory:
 
 ```
-your-working-directory/
+~/analytics/                      ← your configured output folder
 ├── recruiter_performance/        ← from first run
 │   └── models/
 │       ├── staging/
@@ -167,7 +177,7 @@ your-working-directory/
     └── models/...
 ```
 
-When you're happy with a batch, copy the `models/` folder into your dbt project repo.
+Since your output folder points to your project, the generated files land where they belong — no manual copying needed.
 
 ---
 
@@ -197,7 +207,18 @@ export DBT_GEN_API_KEY=gsk-...        # your API key
 export DBT_GEN_MODEL=llama-3.3-70b-versatile  # optional, uses provider default
 ```
 
-Environment variables override the config file. To reconfigure interactively, pick option 5 from the menu.
+Environment variables override the config file. To reconfigure interactively, pick option 6 from the menu. To change just the output folder, pick option 5.
+
+### Config file example
+
+```json
+{
+  "provider": "groq",
+  "api_key": "gsk-...",
+  "model": "llama-3.3-70b-versatile",
+  "output_folder": "/Users/you/repos/analytics"
+}
+```
 
 ### Where to get API keys
 
@@ -210,6 +231,7 @@ Environment variables override the config file. To reconfigure interactively, pi
 ## Tips
 
 - **Start with option 1** ("Create a full model") — it handles everything and you can always remove files you don't need
+- **Point output to your dbt project** — set the output folder to your repo root so generated files land directly in the right place
 - **Describe things like you'd tell a colleague** — "I need a table that shows how many people each recruiter hired per month, with their department" works great
 - **Column names will be guesses** — the AI uses common patterns (e.g. `id`, `created_at`, `status`) but review them against your actual schema before running
 - **Each run is isolated** — you can generate several models side by side and pick what works
@@ -221,6 +243,7 @@ Environment variables override the config file. To reconfigure interactively, pi
 
 - Python 3.9+
 - `openai` package (for OpenAI or Groq) and/or `anthropic` package (for Claude)
+- `tkinter` (included with most Python installs) for the native folder picker — optional, falls back to manual path entry if unavailable
 
 ---
 

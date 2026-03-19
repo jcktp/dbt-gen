@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dbt-gen: AI-powered dbt model generator.
+dbt-gen: dbt model generator — AI-powered or local templates.
 Just run: python3 dbt_gen.py
 """
 
@@ -17,6 +17,12 @@ from pathlib import Path
 CONFIG_PATH = Path.home() / ".dbt-gen.json"
 
 PROVIDERS = {
+    "local": {
+        "name": "Local (templates, no AI)",
+        "models": ["templates"],
+        "default_model": "templates",
+        "env_key": "",
+    },
     "openai": {
         "name": "OpenAI",
         "models": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o3-mini"],
@@ -261,18 +267,32 @@ def setup_api():
     """Interactive API setup. Returns config dict."""
     heading("First-time setup")
 
-    idx, _ = pick("Which AI provider do you want to use?", ["OpenAI", "Groq  (free tier available, very fast)", "Anthropic (Claude)"])
-    provider_key = ["openai", "groq", "anthropic"][idx]
+    idx, _ = pick("Which provider do you want to use?", [
+        "Local templates  (no AI, no API key, works offline)",
+        "OpenAI",
+        "Groq  (free tier available, very fast)",
+        "Anthropic (Claude)",
+    ])
+    provider_key = ["local", "openai", "groq", "anthropic"][idx]
     prov = PROVIDERS[provider_key]
 
-    print()
-    dim(f"Get your key from the {prov['name']} dashboard.")
-    dim(f"It will be saved locally to {CONFIG_PATH}")
-    print()
-    api_key = ask("Paste your API key", secret=True)
+    api_key = ""
+    model = prov["default_model"]
 
-    print()
-    _, model = pick(f"Which model? (recommended: {prov['default_model']})", prov["models"])
+    if provider_key != "local":
+        print()
+        dim(f"Get your key from the {prov['name']} dashboard.")
+        dim(f"It will be saved locally to {CONFIG_PATH}")
+        print()
+        api_key = ask("Paste your API key", secret=True)
+
+        print()
+        _, model = pick(f"Which model? (recommended: {prov['default_model']})", prov["models"])
+    else:
+        print()
+        dim("Local mode — no API key needed.")
+        dim("Files are generated from dbt best-practice templates.")
+        dim("You provide the column names; the tool builds the scaffolding.")
 
     # Ask for output folder during first-time setup
     print()
@@ -311,9 +331,11 @@ def setup_output_folder(config):
 def get_config():
     """Load config or run setup if missing."""
     config = load_config()
-    if config.get("provider") and config.get("api_key"):
+    provider = config.get("provider")
+    has_creds = provider == "local" or (provider and config.get("api_key"))
+    if has_creds:
         if "model" not in config:
-            config["model"] = PROVIDERS[config["provider"]]["default_model"]
+            config["model"] = PROVIDERS.get(provider, {}).get("default_model", "templates")
         # Prompt for output folder if not yet configured
         if not config.get("output_folder"):
             print()
@@ -392,6 +414,404 @@ def _groq(prompt, key, model):
     r = client.chat.completions.create(model=model, max_tokens=MAX_TOKENS, temperature=0.2,
         messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}])
     return r.choices[0].message.content
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Local template engine (no AI)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_columns(text):
+    """Parse a comma/newline separated column list into clean names.
+    Accepts 'id, name, created_at' or multi-line input."""
+    raw = text.replace("\n", ",")
+    cols = [c.strip().lower().replace(" ", "_") for c in raw.split(",") if c.strip()]
+    return cols or ["id", "created_at", "updated_at"]
+
+
+def _safe_source(name):
+    """Lowercase, underscore-only source/table name."""
+    return "".join(c if c.isalnum() or c == "_" else "_" for c in name.lower().strip()).strip("_")
+
+
+def _guess_pk(table, columns):
+    """Guess the primary key column from a column list."""
+    table_s = _safe_source(table)
+    # Try table-specific id first, then generic id
+    for candidate in [f"{table_s}_id", "id", f"{table_s.rstrip('s')}_id"]:
+        if candidate in columns:
+            return candidate
+    # First column ending in _id
+    for c in columns:
+        if c.endswith("_id"):
+            return c
+    return columns[0] if columns else "id"
+
+
+def _col_type_guess(col):
+    """Guess a SQL cast for a column based on its name."""
+    c = col.lower()
+    if c.endswith("_at") or c.endswith("_date") or c in ("created", "updated", "deleted", "hired_on", "start_date", "end_date"):
+        return "timestamp"
+    if c.endswith("_id") or c == "id":
+        return "varchar"
+    if c in ("amount", "salary", "cost", "price", "revenue", "rate", "score", "total"):
+        return "numeric"
+    if c in ("count", "quantity", "headcount", "age", "year", "month"):
+        return "integer"
+    if c.startswith("is_") or c.startswith("has_"):
+        return "boolean"
+    return "varchar"
+
+
+def _build_source_yaml(system, tables_with_cols):
+    """Build a _sources.yml file.
+    tables_with_cols: list of (table_name, [columns])"""
+    src = _safe_source(system)
+    lines = [
+        "version: 2",
+        "",
+        "sources:",
+        f"  - name: {src}",
+        f"    description: \"Raw data from {system}\"",
+        f"    # database: your_database",
+        f"    # schema: raw_{src}",
+        "    tables:",
+    ]
+    for table, cols in tables_with_cols:
+        tbl = _safe_source(table)
+        lines.append(f"      - name: {tbl}")
+        lines.append(f"        description: \"Raw {table} table from {system}\"")
+        if cols:
+            lines.append(f"        columns:")
+            for col in cols:
+                lines.append(f"          - name: {col}")
+                lines.append(f"            description: \"TODO: describe {col}\"")
+    return "\n".join(lines) + "\n"
+
+
+def _build_staging_sql(system, table, columns):
+    """Build a stg_<source>__<table>.sql file."""
+    src = _safe_source(system)
+    tbl = _safe_source(table)
+
+    cast_lines = []
+    for col in columns:
+        ct = _col_type_guess(col)
+        cast_lines.append(f"        cast({col} as {ct}) as {col}")
+
+    cast_block = ",\n".join(cast_lines)
+
+    return (
+        f"with source as (\n"
+        f"\n"
+        f"    select * from {{{{ source('{src}', '{tbl}') }}}}\n"
+        f"\n"
+        f"),\n"
+        f"\n"
+        f"renamed as (\n"
+        f"\n"
+        f"    select\n"
+        f"\n"
+        f"{cast_block}\n"
+        f"\n"
+        f"    from source\n"
+        f"\n"
+        f")\n"
+        f"\n"
+        f"select * from renamed\n"
+    )
+
+
+def _build_staging_yaml(system, table, columns):
+    """Build a schema YAML for a staging model."""
+    src = _safe_source(system)
+    tbl = _safe_source(table)
+    model_name = f"stg_{src}__{tbl}"
+    pk = _guess_pk(table, columns)
+
+    lines = [
+        "version: 2",
+        "",
+        "models:",
+        f"  - name: {model_name}",
+        f"    description: \"Staged {table} data from {system} — cleaned, typed, renamed\"",
+        "    columns:",
+    ]
+    for col in columns:
+        lines.append(f"      - name: {col}")
+        lines.append(f"        description: \"TODO: describe {col}\"")
+        if col == pk:
+            lines.append(f"        tests:")
+            lines.append(f"          - unique")
+            lines.append(f"          - not_null")
+    return "\n".join(lines) + "\n"
+
+
+def _build_intermediate_sql(name, inputs_text):
+    """Build an intermediate model SQL with ref() CTEs."""
+    refs = [r.strip() for r in inputs_text.replace("\n", ",").split(",") if r.strip()]
+    ctes = []
+    for ref in refs:
+        safe = _safe_source(ref)
+        ctes.append(f"    {safe} as (\n\n        select * from {{{{ ref('{ref}') }}}}\n\n    )")
+
+    cte_block = ",\n\n".join(ctes) if ctes else f"    source as (\n\n        select * from {{{{ ref('TODO_model_name') }}}}\n\n    )"
+
+    return f"with\n\n{cte_block}\n\n-- TODO: Add your joins, filters, and transformations here\n\nselect\n    *\nfrom {_safe_source(refs[0]) if refs else 'source'}\n"
+
+
+def _build_intermediate_yaml(name):
+    """Build a schema YAML for an intermediate model."""
+    safe = _safe_source(name)
+    model_name = f"int_{safe}" if not safe.startswith("int_") else safe
+    return textwrap.dedent(f"""\
+        version: 2
+
+        models:
+          - name: {model_name}
+            description: "TODO: Describe what this intermediate model does"
+            columns:
+              - name: TODO_primary_key
+                description: "TODO: describe"
+                tests:
+                  - unique
+                  - not_null
+    """)
+
+
+def _build_mart_sql(name, inputs_text, is_dim=False):
+    """Build a mart model SQL."""
+    prefix = "dim" if is_dim else "fct"
+    refs = [r.strip() for r in inputs_text.replace("\n", ",").split(",") if r.strip()]
+    ctes = []
+    for ref in refs:
+        safe = _safe_source(ref)
+        ctes.append(f"    {safe} as (\n\n        select * from {{{{ ref('{ref}') }}}}\n\n    )")
+
+    cte_block = ",\n\n".join(ctes) if ctes else f"    source as (\n\n        select * from {{{{ ref('TODO_model_name') }}}}\n\n    )"
+
+    config = "materialized='table'" if not is_dim else "materialized='table'"
+    first = _safe_source(refs[0]) if refs else "source"
+
+    return f"""{{{{% config({config}) %}}}}\n\nwith\n\n{cte_block}\n\n-- TODO: Add your final select — this is the table your dashboards read from\n\nselect\n    *\nfrom {first}\n"""
+
+
+def _build_mart_yaml(name, is_dim=False):
+    """Build a schema YAML for a mart model."""
+    safe = _safe_source(name)
+    prefix = "dim" if is_dim else "fct"
+    model_name = f"{prefix}_{safe}" if not safe.startswith(("dim_", "fct_")) else safe
+    return textwrap.dedent(f"""\
+        version: 2
+
+        models:
+          - name: {model_name}
+            description: "TODO: Describe what this final table contains and its grain"
+            columns:
+              - name: TODO_primary_key
+                description: "TODO: describe"
+                tests:
+                  - unique
+                  - not_null
+    """)
+
+
+def local_staging(system, table, columns_text, notes=""):
+    """Generate staging files from templates. Returns the standard result dict."""
+    src = _safe_source(system)
+    tbl = _safe_source(table)
+    columns = _parse_columns(columns_text)
+
+    files = [
+        {
+            "path": f"models/staging/{src}/_sources.yml",
+            "content": _build_source_yaml(system, [(table, columns)]),
+            "description": f"Source definition for {system}",
+        },
+        {
+            "path": f"models/staging/{src}/stg_{src}__{tbl}.sql",
+            "content": _build_staging_sql(system, table, columns),
+            "description": f"Staging model — cleans and types raw {table} data",
+        },
+        {
+            "path": f"models/staging/{src}/_{src}__models.yml",
+            "content": _build_staging_yaml(system, table, columns),
+            "description": f"Schema, descriptions, and tests for stg_{src}__{tbl}",
+        },
+    ]
+
+    return {
+        "files": files,
+        "summary": f"Generated staging model for {system}.{table} with {len(columns)} columns. "
+                   f"Review the SQL casts and column descriptions, then fill in the TODOs.",
+        "next_steps": [
+            "Check that column names match your warehouse exactly",
+            "Update the database/schema in _sources.yml",
+            "Fill in column descriptions in the YAML",
+            f"Run: dbt run --select stg_{src}__{tbl}",
+        ],
+    }
+
+
+def local_full_model(name, sources_parsed, description=""):
+    """Generate a full model chain from templates.
+    sources_parsed: list of (system, [(table, [columns]), ...])"""
+    files = []
+    all_stg_refs = []
+
+    for system, tables_with_cols in sources_parsed:
+        src = _safe_source(system)
+        # Source YAML
+        files.append({
+            "path": f"models/staging/{src}/_sources.yml",
+            "content": _build_source_yaml(system, tables_with_cols),
+            "description": f"Source definition for {system}",
+        })
+        for table, columns in tables_with_cols:
+            tbl = _safe_source(table)
+            stg_name = f"stg_{src}__{tbl}"
+            all_stg_refs.append(stg_name)
+            # Staging SQL
+            files.append({
+                "path": f"models/staging/{src}/{stg_name}.sql",
+                "content": _build_staging_sql(system, table, columns),
+                "description": f"Staging model for {table}",
+            })
+        # Staging YAML (one per source system covering all tables)
+        yaml_lines = ["version: 2", "", "models:"]
+        for table, columns in tables_with_cols:
+            tbl = _safe_source(table)
+            stg_name = f"stg_{src}__{tbl}"
+            pk = _guess_pk(table, columns)
+            yaml_lines.append(f"  - name: {stg_name}")
+            yaml_lines.append(f"    description: \"Staged {table} data from {system}\"")
+            yaml_lines.append(f"    columns:")
+            for col in columns:
+                yaml_lines.append(f"      - name: {col}")
+                yaml_lines.append(f"        description: \"TODO: describe {col}\"")
+                if col == pk:
+                    yaml_lines.append(f"        tests:")
+                    yaml_lines.append(f"          - unique")
+                    yaml_lines.append(f"          - not_null")
+        files.append({
+            "path": f"models/staging/{src}/_{src}__models.yml",
+            "content": "\n".join(yaml_lines) + "\n",
+            "description": f"Schema YAML for all {system} staging models",
+        })
+
+    safe = _safe_source(name)
+    domain = safe  # use model name as domain folder
+
+    # Intermediate model (if more than one staging ref)
+    if len(all_stg_refs) > 1:
+        int_name = f"int_{safe}_joined"
+        int_refs_text = ", ".join(all_stg_refs)
+        files.append({
+            "path": f"models/intermediate/{domain}/{int_name}.sql",
+            "content": _build_intermediate_sql(safe, int_refs_text),
+            "description": f"Joins staging models together",
+        })
+        files.append({
+            "path": f"models/intermediate/{domain}/_{domain}__models.yml",
+            "content": _build_intermediate_yaml(f"{safe}_joined"),
+            "description": f"Schema YAML for intermediate model",
+        })
+        mart_input = int_name
+    else:
+        mart_input = all_stg_refs[0] if all_stg_refs else "TODO_model"
+
+    # Mart model
+    fct_name = f"fct_{safe}"
+    files.append({
+        "path": f"models/marts/{domain}/{fct_name}.sql",
+        "content": _build_mart_sql(safe, mart_input),
+        "description": f"Final output table for {name}",
+    })
+    files.append({
+        "path": f"models/marts/{domain}/_{domain}__models.yml",
+        "content": _build_mart_yaml(safe),
+        "description": f"Schema YAML for {fct_name}",
+    })
+
+    return {
+        "files": files,
+        "summary": f"Generated {len(files)} files: source definitions, staging models, "
+                   f"{'an intermediate join, ' if len(all_stg_refs) > 1 else ''}"
+                   f"and the final mart table. Fill in the TODOs and verify column names.",
+        "next_steps": [
+            "Check that all column names match your warehouse schema",
+            "Update database/schema in each _sources.yml",
+            "Fill in column descriptions and add tests",
+            "Complete the intermediate join logic (if generated)",
+            "Write the final SELECT in the mart model",
+            f"Run: dbt run --select +{fct_name}",
+        ],
+    }
+
+
+def local_transformation(name, inputs_text, description=""):
+    """Generate an intermediate model from templates."""
+    safe = _safe_source(name)
+    model_name = f"int_{safe}" if not safe.startswith("int_") else safe
+    domain = safe.replace("int_", "", 1) if safe.startswith("int_") else safe
+
+    files = [
+        {
+            "path": f"models/intermediate/{domain}/{model_name}.sql",
+            "content": _build_intermediate_sql(name, inputs_text),
+            "description": f"Intermediate model — joins/transforms input models",
+        },
+        {
+            "path": f"models/intermediate/{domain}/_{domain}__models.yml",
+            "content": _build_intermediate_yaml(name),
+            "description": f"Schema YAML for {model_name}",
+        },
+    ]
+
+    return {
+        "files": files,
+        "summary": f"Generated intermediate model {model_name} with ref() CTEs for each input. "
+                   f"Add your join/filter/aggregation logic in the SQL file.",
+        "next_steps": [
+            "Replace the TODO select with your actual join logic",
+            "Update column descriptions in the YAML",
+            f"Run: dbt run --select {model_name}",
+        ],
+    }
+
+
+def local_final_table(name, inputs_text, description=""):
+    """Generate a mart model from templates."""
+    safe = _safe_source(name)
+    is_dim = "dim" in safe or "dimension" in description.lower()
+    prefix = "dim" if is_dim else "fct"
+    model_name = f"{prefix}_{safe}" if not safe.startswith(("dim_", "fct_")) else safe
+    domain = safe
+
+    files = [
+        {
+            "path": f"models/marts/{domain}/{model_name}.sql",
+            "content": _build_mart_sql(safe, inputs_text, is_dim=is_dim),
+            "description": f"Mart model — the final table for consumption",
+        },
+        {
+            "path": f"models/marts/{domain}/_{domain}__models.yml",
+            "content": _build_mart_yaml(safe, is_dim=is_dim),
+            "description": f"Schema YAML for {model_name}",
+        },
+    ]
+
+    return {
+        "files": files,
+        "summary": f"Generated mart model {model_name}. "
+                   f"Fill in the final SELECT and column descriptions.",
+        "next_steps": [
+            "Write the final SELECT query in the SQL file",
+            "Add all output columns to the schema YAML with descriptions",
+            "Add tests: unique + not_null on the primary key, accepted_values where relevant",
+            f"Run: dbt run --select {model_name}",
+        ],
+    }
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # File writing
@@ -487,6 +907,47 @@ def ask_single_source():
     return system, table
 
 
+def _ask_sources_with_columns():
+    """Ask for source systems, tables, and their columns (for local mode).
+    Returns: list of (system, [(table, [columns]), ...])"""
+    result = []
+
+    system = ask_system()
+    print()
+    tables_raw = ask(f"Which tables from {system}?\n  (comma-separated, e.g. applications, offers, jobs)")
+    tables = [t.strip() for t in tables_raw.split(",") if t.strip()]
+
+    tables_with_cols = []
+    for table in tables:
+        print()
+        cols_text = ask(f"Columns in {C.BOLD}{system}.{table}{C.RESET}?\n  (comma-separated, e.g. id, name, created_at)")
+        cols = _parse_columns(cols_text)
+        tables_with_cols.append((table, cols))
+
+    result.append((system, tables_with_cols))
+
+    while True:
+        print()
+        if not yesno("Add another system?", default_yes=False):
+            break
+        print()
+        system = ask_system()
+        print()
+        tables_raw = ask(f"Which tables from {system}?\n  (comma-separated)")
+        tables = [t.strip() for t in tables_raw.split(",") if t.strip()]
+
+        tables_with_cols = []
+        for table in tables:
+            print()
+            cols_text = ask(f"Columns in {C.BOLD}{system}.{table}{C.RESET}?\n  (comma-separated)")
+            cols = _parse_columns(cols_text)
+            tables_with_cols.append((table, cols))
+
+        result.append((system, tables_with_cols))
+
+    return result
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # The actual generation flows
 # ──────────────────────────────────────────────────────────────────────────────
@@ -502,18 +963,34 @@ def generate_full_model(config):
     name = ask("What should this model be called?\n  (this becomes your folder name, e.g. recruiter_performance)")
     folder = _safe_name(name)
 
+    is_local = config.get("provider") == "local"
+
     print()
-    sources = ask_sources()
+    sources_text = ask_sources()
 
     print()
     description = ask("What should the final output look like? Describe it like\n  you'd explain it to a colleague", multiline=True)
 
-    prompt = f"""\
+    if is_local:
+        # Collect structured column info for local templates
+        print()
+        heading("Column details (local mode)")
+        dim("Since we're generating from templates, I need the actual")
+        dim("column names for each table. Comma-separated is fine.")
+        print()
+
+        sources_parsed = _ask_sources_with_columns()
+
+        print()
+        dim("Generating from templates...")
+        result = local_full_model(name, sources_parsed, description)
+    else:
+        prompt = f"""\
 Generate a COMPLETE dbt model chain based on this analyst's request.
 
 MODEL NAME: {name}
 DATA SOURCES:
-{sources}
+{sources_text}
 WHAT IT SHOULD DO: {description}
 
 Determine the right structure:
@@ -525,7 +1002,8 @@ Determine the right structure:
 Generate ALL files with proper dbt naming, structure, YAML schemas, and tests.
 Use sensible column names based on common data patterns. Note any assumptions.
 """
-    result = call_llm(prompt, config)
+        result = call_llm(prompt, config)
+
     write_output(result, folder, config.get("output_folder"))
     return folder
 
@@ -538,6 +1016,8 @@ def generate_staging(config):
     dim("renaming columns, fixing types, nothing complex.")
     print()
 
+    is_local = config.get("provider") == "local"
+
     system, table = ask_single_source()
 
     default_name = f"{_safe_name(system)}_{_safe_name(table)}"
@@ -546,13 +1026,21 @@ def generate_staging(config):
     folder = _safe_name(name)
 
     print()
-    columns = ask("What columns does this table have? (or just describe\n  the table and I'll make reasonable guesses)", multiline=True)
+    if is_local:
+        columns = ask(f"What columns does this table have?\n  (comma-separated, e.g. id, name, status, created_at)", multiline=True)
+    else:
+        columns = ask("What columns does this table have? (or just describe\n  the table and I'll make reasonable guesses)", multiline=True)
 
     print()
     notes = ask("Anything special to do? (e.g. rename id to application_id,\n  cast dates, filter out deleted rows)\n  Leave blank if standard cleanup is fine",
                 required=False)
 
-    prompt = f"""\
+    if is_local:
+        print()
+        dim("Generating from templates...")
+        result = local_staging(system, table, columns, notes)
+    else:
+        prompt = f"""\
 Generate a dbt STAGING model.
 
 SOURCE SYSTEM: {system}
@@ -565,7 +1053,8 @@ Generate:
 2. Staging SQL model (stg_<source>__<entity>.sql)
 3. Schema YAML with tests and descriptions
 """
-    result = call_llm(prompt, config)
+        result = call_llm(prompt, config)
+
     write_output(result, folder, config.get("output_folder"))
     return folder
 
@@ -578,6 +1067,8 @@ def generate_transformation(config):
     dim("from your existing staging models into something new.")
     print()
 
+    is_local = config.get("provider") == "local"
+
     name = ask("What should this be called? (e.g. applications_with_offers)")
     folder = _safe_name(name)
 
@@ -587,7 +1078,12 @@ def generate_transformation(config):
     print()
     description = ask("What should it do? Describe it plainly", multiline=True)
 
-    prompt = f"""\
+    if is_local:
+        print()
+        dim("Generating from templates...")
+        result = local_transformation(name, inputs, description)
+    else:
+        prompt = f"""\
 Generate a dbt INTERMEDIATE model.
 
 NAME: {name}
@@ -598,7 +1094,8 @@ Generate:
 1. Intermediate SQL model (int_<entity>_<verb>.sql)
 2. Schema YAML with tests and column descriptions
 """
-    result = call_llm(prompt, config)
+        result = call_llm(prompt, config)
+
     write_output(result, folder, config.get("output_folder"))
     return folder
 
@@ -611,6 +1108,8 @@ def generate_final_table(config):
     dim("It pulls from your other models and presents the finished data.")
     print()
 
+    is_local = config.get("provider") == "local"
+
     name = ask("What should this table be called? (e.g. recruiter_performance_monthly)")
     folder = _safe_name(name)
 
@@ -620,7 +1119,12 @@ def generate_final_table(config):
     print()
     description = ask("What should the final table contain? What columns,\n  what grain (one row per...)?", multiline=True)
 
-    prompt = f"""\
+    if is_local:
+        print()
+        dim("Generating from templates...")
+        result = local_final_table(name, inputs, description)
+    else:
+        prompt = f"""\
 Generate a dbt MART model.
 
 NAME: {name}
@@ -631,7 +1135,8 @@ Generate:
 1. Mart SQL model (dim_ or fct_ prefix as appropriate)
 2. Schema YAML with comprehensive column descriptions and tests
 """
-    result = call_llm(prompt, config)
+        result = call_llm(prompt, config)
+
     write_output(result, folder, config.get("output_folder"))
     return folder
 
@@ -672,7 +1177,10 @@ def main():
             prov = PROVIDERS.get(config["provider"], {})
             out = config.get("output_folder", "(current directory)")
             print()
-            dim(f"Using {prov.get('name', '?')} ({config.get('model', '?')})")
+            if config.get("provider") == "local":
+                dim(f"Using local templates (no AI)")
+            else:
+                dim(f"Using {prov.get('name', '?')} ({config.get('model', '?')})")
             dim(f"Output → {out}")
             print()
 

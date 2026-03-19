@@ -29,7 +29,7 @@ Every run creates a named folder in your current directory. Review the files, ad
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/your-org/dbt-gen.git
+git clone https://github.com/jcktp/dbt-gen.git
 cd dbt-gen
 
 # 2. Install the SDK for your provider (pick one)
